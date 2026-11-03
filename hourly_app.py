@@ -342,8 +342,15 @@ def inventory_table(forecast: pd.DataFrame, stock: pd.DataFrame, ratio: float):
     return merged
 
 
-def transfer_suggestions(table: pd.DataFrame):
-    columns = ["보내는 대여소", "받는 대여소", "이동 참고량", "직선거리", "부족 예상", "권장 방식", "실행 제안", "추천 이유"]
+def transfer_suggestions(
+    table: pd.DataFrame,
+    road_factor: float,
+    field_speed_kmh: float,
+    citizen_speed_kmh: float,
+    field_buffer_min: int,
+    citizen_buffer_min: int,
+):
+    columns = ["보내는 대여소", "받는 대여소", "이동 참고량", "직선거리", "예상 소요", "부족 예상", "늦어도 출발", "권장 방식", "실행 제안", "추천 이유"]
     if table.empty:
         return pd.DataFrame(columns=columns)
     donors = table[table["surplus"] >= 1].copy()
@@ -363,6 +370,7 @@ def transfer_suggestions(table: pd.DataFrame):
             _, didx, dist = min(distances, key=lambda item: item[0])
             qty = min(int(donors.loc[didx, "left"]), int(receivers.loc[ridx, "left"]))
             lead_hours = receivers.loc[ridx].get("hours_until_shortage", np.nan)
+            shortage_time = receivers.loc[ridx].get("first_shortage_time", pd.NaT)
             urgent = pd.notna(lead_hours) and float(lead_hours) <= 2
             nearby = dist is not None and dist <= 1.0
             citizen_candidate = qty <= 5 and nearby and not urgent
@@ -370,9 +378,13 @@ def transfer_suggestions(table: pd.DataFrame):
                 method = "시민 참여 후보"
                 action = "출발지에서 대여 → 도착지에 반납 미션 안내"
                 reason = "소량·1km 이내·2시간 이상 여유"
+                speed_kmh = citizen_speed_kmh
+                buffer_min = citizen_buffer_min
             else:
                 method = "현장팀 우선"
                 action = "현장팀 차량으로 출발지 수거 → 도착지 보충"
+                speed_kmh = field_speed_kmh
+                buffer_min = field_buffer_min
                 reasons = []
                 if urgent:
                     reasons.append("부족까지 2시간 이내")
@@ -383,12 +395,28 @@ def transfer_suggestions(table: pd.DataFrame):
                 elif not nearby:
                     reasons.append("직선거리 1km 초과")
                 reason = " · ".join(reasons) if reasons else "시민 참여 조건에 해당하지 않음"
+            if dist is not None and pd.notna(shortage_time):
+                estimated_minutes = int(math.ceil((float(dist) * road_factor / speed_kmh) * 60 + buffer_min))
+                dispatch_by = pd.Timestamp(shortage_time) - pd.Timedelta(minutes=estimated_minutes)
+                now = pd.Timestamp.now()
+                if dispatch_by <= now:
+                dispatch_label = "출발 권고 시각 경과 · 즉시 판단"
+                elif dispatch_by - now <= pd.Timedelta(minutes=5):
+                    dispatch_label = "지금 출발 권고"
+                else:
+                    dispatch_label = dispatch_by.strftime("%m/%d %H:%M까지")
+                duration_label = f"약 {estimated_minutes}분*"
+            else:
+                duration_label = "산정 자료 필요"
+                dispatch_label = "거리·부족 시각 필요"
             results.append({
                 "보내는 대여소": donors.loc[didx, "station_name"],
                 "받는 대여소": receivers.loc[ridx, "station_name"],
                 "이동 참고량": f"{qty}대",
                 "직선거리": f"{dist:.1f} km" if dist is not None else "위치자료 없음",
+                "예상 소요": duration_label,
                 "부족 예상": f"약 {max(0, int(round(float(lead_hours))))}시간 후" if pd.notna(lead_hours) else "예측 기간 내",
+                "최소 출발 시각": dispatch_label,
                 "권장 방식": method,
                 "실행 제안": action,
                 "추천 이유": reason,
@@ -416,6 +444,13 @@ def sidebar(history, is_demo, demo_stock):
         focus = st.selectbox("분석 대여소", station_ids, format_func=lambda sid: ids.get(sid, str(sid)))
         horizon = st.select_slider("예측 범위", options=[1, 2, 6, 12, 24], value=24, format_func=lambda h: f"다음 {h}시간")
         ratio = st.slider("최소 재고 기준", 10, 50, 25, 5) / 100
+        with st.expander("이동시간 계산 기준"):
+            st.caption("직선거리에 도로 우회율을 곱한 뒤, 설정 평균속도와 준비 여유시간으로 추정합니다.")
+            road_factor = st.slider("도로 우회율", 1.0, 2.0, 1.3, 0.1, help="직선거리 대비 실제 도로 경로를 가정하는 배율")
+            field_speed = st.number_input("현장 차량 평균속도 (km/h)", min_value=5.0, max_value=60.0, value=20.0, step=1.0)
+            citizen_speed = st.number_input("시민 자전거 평균속도 (km/h)", min_value=5.0, max_value=30.0, value=12.0, step=1.0)
+            field_buffer = st.number_input("현장팀 상·하차 여유 (분)", min_value=0, max_value=60, value=15, step=5)
+            citizen_buffer = st.number_input("시민 대여·반납 여유 (분)", min_value=0, max_value=30, value=5, step=5)
         st.markdown("---")
         st.markdown("**현재 재고 연결**")
         api_key = st.text_input("서울시 Open API 인증키", type="password")
@@ -444,12 +479,12 @@ def sidebar(history, is_demo, demo_stock):
         st.caption("시간 데이터 출처")
         st.markdown(f"[대여 이력 원본 ↗]({HISTORY_URL})  ")
         st.markdown(f"[시간대별 이용 정보 ↗]({HOURLY_URL})")
-    return history, is_demo, focus, horizon, ratio, stock, current, capacity
+    return history, is_demo, focus, horizon, ratio, road_factor, field_speed, citizen_speed, field_buffer, citizen_buffer, stock, current, capacity
 
 
 def main():
     demo, demo_stock = make_demo_hourly()
-    history, is_demo, focus_id, horizon, ratio, stock, manual_current, manual_capacity = sidebar(demo, True, demo_stock)
+    history, is_demo, focus_id, horizon, ratio, road_factor, field_speed, citizen_speed, field_buffer, citizen_buffer, stock, manual_current, manual_capacity = sidebar(demo, True, demo_stock)
     if is_demo and stock.empty:
         stock = demo_stock
         st.session_state["hourly_stock_label"] = "화면 예시 재고"
@@ -507,7 +542,7 @@ def main():
     c4.metric("최소 기준까지 이동 참고량", f"{need}대", help=f"거치대 {capacity}대, 최소 재고 기준 {target}대")
 
     moves = inventory_table(forecast, stock, ratio)
-    suggestions = transfer_suggestions(moves)
+    suggestions = transfer_suggestions(moves, road_factor, field_speed, citizen_speed, field_buffer, citizen_buffer)
     st.markdown('<div class="section-title">재고 이동과 권장 실행 방식</div>', unsafe_allow_html=True)
     if is_demo:
         st.caption("예시 재고와 예시 모델 결과를 표시 중입니다.")
@@ -525,6 +560,7 @@ def main():
         action2.caption("앱에서 여유 대여소 대여 → 부족 대여소 반납 미션 안내")
         st.dataframe(suggestions.head(8), use_container_width=True, hide_index=True)
         st.caption("시민 참여 후보는 앱 미션·보상 정책이 실제로 적용되는 대여소에서만 운영할 수 있습니다. 이 화면은 미션을 자동 발행하거나 보상을 지급하지 않습니다.")
+        st.caption("* 늦어도 출발할 시각 = 부족 예상 시각 − (직선거리 × 도로 우회율 ÷ 평균속도 × 60 + 준비 여유분). 실시간 교통·실제 도로 경로는 반영하지 않는 계획용 추정치입니다.")
     st.caption(f"선택 대여소: {focus_name} · 현재 {current_bikes}대 · 거치대 {capacity}대 · 최소 기준 {target}대 · 학습 대여소 {station_count}곳")
 
     left, right = st.columns([1.08, 0.92], gap="medium")
